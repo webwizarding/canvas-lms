@@ -24,6 +24,75 @@ Canvas records quiz log data from both the quiz-taking front end and the quiz
 submission pipeline. This is the exact capture outline so you can implement the
 same pattern in another web app.
 
+Implementation at a glance (copy/paste friendly):
+
+```js
+// 1) Define event types and constants.
+const EVENT_TYPES = {
+  PAGE_FOCUSED: 'page_focused',
+  PAGE_BLURRED: 'page_blurred',
+  QUESTION_VIEWED: 'question_viewed',
+  QUESTION_FLAGGED: 'question_flagged',
+  SESSION_STARTED: 'session_started',
+}
+const STORAGE_KEY = 'qla_events'
+const DELIVERY_INTERVAL_MS = 15000
+
+// 2) Basic event object format.
+function makeEvent(eventType, eventData) {
+  return {
+    event_type: eventType,
+    event_data: eventData ?? null,
+    client_timestamp: new Date().toISOString(),
+  }
+}
+
+// 3) Buffer (localStorage-backed).
+function loadBuffer() {
+  try {
+    return JSON.parse(localStorage.getItem(STORAGE_KEY) || '[]')
+  } catch {
+    return []
+  }
+}
+function saveBuffer(buffer) {
+  try {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(buffer))
+  } catch {
+    // Ignore quota errors; you can add telemetry here.
+  }
+}
+
+// 4) Enqueue + de-dupe example for page focus.
+let lastEventType = null
+function enqueueEvent(buffer, event) {
+  if (event.event_type === EVENT_TYPES.PAGE_FOCUSED && lastEventType !== EVENT_TYPES.PAGE_BLURRED) {
+    return
+  }
+  buffer.push(event)
+  lastEventType = event.event_type
+  saveBuffer(buffer)
+}
+
+// 5) Delivery loop.
+async function deliverEvents(buffer, endpointUrl) {
+  if (!buffer.length) return
+  const payload = {quiz_submission_events: buffer}
+  const res = await fetch(endpointUrl, {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(payload),
+    credentials: 'include',
+  })
+  if (res.ok) {
+    buffer.length = 0
+    saveBuffer(buffer)
+  }
+}
+```
+
+End-to-end walkthrough (client + server):
+
 1. Boot the quiz log client on the quiz-taking page. Canvas wires
    `ui/shared/quiz-log-auditing/jquery/log_auditing.js` and registers trackers,
    configures localStorage buffering, and sets the delivery URL from
@@ -58,6 +127,16 @@ same pattern in another web app.
    for a specific attempt ordered by server `created_at` and filtered to events
    created after the attempt started.
 
+Client capture details (Canvas implementation):
+
+- Buffering strategy: `EventBuffer` loads/saves events in localStorage under
+  `qla_events` (`ui/shared/quiz-log-auditing/jquery/event_buffer.js`).
+- Delivery strategy: `EventManager` batches pending events and POSTs to
+  `ENV.QUIZ_SUBMISSION_EVENTS_URL` every 15000 ms
+  (`ui/shared/quiz-log-auditing/jquery/event_manager.js`).
+- Trackers are installed by `ui/shared/quiz-log-auditing/jquery/log_auditing.js`
+  and run on the quiz-taking page only.
+
 Event types and payloads captured by the client:
 - `page_focused`: window focus, throttled to 5000 ms, `event_data` null
 - `page_blurred`: window blur, throttled to 5000 ms, `event_data` null
@@ -71,6 +150,64 @@ Event types and payloads captured by the client:
 Event types captured server-side:
 - `question_answered`: derived from backup payloads, `event_data` is an array of
   `{ "quiz_question_id": "<id>", "answer": <serialized answer> }`
+
+Server storage model (Canvas implementation):
+
+```rb
+# app/models/quizzes/quiz_submission_event.rb
+class Quizzes::QuizSubmissionEvent < ActiveRecord::Base
+  # event_type: string
+  # event_data: JSON
+  # client_timestamp: datetime
+  # created_at: datetime (server time)
+  # attempt: integer
+  # quiz_submission_id: integer
+end
+```
+
+Server ingest (Canvas implementation):
+
+```rb
+# app/controllers/quizzes/quiz_submission_events_api_controller.rb
+def create
+  if authorized_action(@quiz_submission, @current_user, :record_events)
+    params["quiz_submission_events"]&.each do |datum|
+      Quizzes::QuizSubmissionEvent.create do |event|
+        event.quiz_submission_id = @quiz_submission.id
+        event.event_type = datum["event_type"]
+        event.event_data = datum["event_data"]
+        event.client_timestamp = datum["client_timestamp"]
+        event.attempt = @quiz_submission.attempt
+      end
+    end
+    head :no_content
+  end
+end
+```
+
+Server-side answer extraction (Canvas implementation):
+
+```rb
+# app/models/quizzes/log_auditing/question_answered_event_extractor.rb
+# Extracts question_<id> fields from the submission payload, serializes answers,
+# and stores one event per backup if new answers were found.
+def create_event!(submission_data, quiz_submission)
+  event = build_event(submission_data, quiz_submission)
+  predecessors = Quizzes::QuizSubmissionEvent.where(SQL_FIND_PREDECESSORS, {
+    quiz_submission_id: quiz_submission.id,
+    attempt: event.attempt,
+    started_at: quiz_submission.started_at,
+    created_at: event.created_at
+  }).order(created_at: :desc)
+
+  if predecessors.any?
+    optimizer = Quizzes::LogAuditing::QuestionAnsweredEventOptimizer.new
+    optimizer.run!(event.answers, predecessors)
+  end
+
+  event.tap(&:save!) if event.answers.any?
+end
+```
 
 Example client payload:
 
@@ -116,3 +253,19 @@ Example server-extracted `question_answered` event payload:
 Storage fields for each event:
 `quiz_submission_id`, `attempt`, `event_type`, `event_data`, `client_timestamp`,
 and server `created_at`.
+
+If you are implementing this in another website:
+
+1. Build a client event pipeline with:
+   - A small set of event types
+   - A local buffer (memory + localStorage fallback)
+   - A batch delivery loop (15s is a reasonable starting point)
+2. Define a stable event schema (`event_type`, `event_data`, `client_timestamp`)
+   and version it if you expect to evolve it.
+3. Send events to a server endpoint that:
+   - Authenticates the user/session
+   - Stamps server time (`created_at`)
+   - Stores the attempt or session context
+4. (Optional but recommended) Parse answer data server-side on backup to record
+   authoritative `question_answered` events, which are harder to spoof than
+   client-reported answer changes.
